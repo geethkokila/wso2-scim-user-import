@@ -34,5 +34,6 @@ Following configurations has to be there in config.properties file
 
 To build the code, 
      mvn clean package
-Run 
+     
+Run the code
     mvn exec:java
