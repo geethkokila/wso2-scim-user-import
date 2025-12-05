@@ -78,6 +78,10 @@ public class CSVSCIMImporterV1 {
     // Use same store for groups
     private static final String GROUP_STORE_DOMAIN = USER_STORE_DOMAIN;
 
+    // Max members per PATCH to avoid huge payloads
+    private static final int GROUP_PATCH_BATCH_SIZE =
+            Integer.parseInt(CONFIG.getProperty("group.patch.batch.size", "200"));
+
     // Debug flag (prints request bodies, etc.)
     private static final boolean DEBUG =
             Boolean.parseBoolean(CONFIG.getProperty("debug.enabled", "true"));
@@ -172,7 +176,7 @@ public class CSVSCIMImporterV1 {
                         .add(member);
             }
 
-            // 3) Ensure groups exist, then update them with members (PATCH)
+            // 3) Ensure groups exist, then update them with members (PATCH, with batching)
             System.out.println("Creating/Updating SCIM groups (roles) with members...");
             for (RoleRow role : roles.values()) {
                 List<GroupMember> members = roleIdToMembers.get(role.umId);
@@ -405,9 +409,6 @@ public class CSVSCIMImporterV1 {
                 root.put("password", user.password);
             }
 
-            // Keep old UM_ID for traceability
-            root.put("externalId", user.umId);
-
             // ==== ONLY THESE ATTRIBUTES ARE USED NOW ====
             String teacherId      = attrs.get("teacherid");
             String givenNameAttr  = attrs.get("givenName");
@@ -415,6 +416,11 @@ public class CSVSCIMImporterV1 {
             String screenNameAttr = attrs.get("screenName");
             String mail           = attrs.get("mail");
             // ============================================
+
+            // externalId should carry teacherid; fallback to UM_ID if teacherid is missing
+            String externalIdVal =
+                    (teacherId != null && !teacherId.isBlank()) ? teacherId : user.umId;
+            root.put("externalId", externalIdVal);
 
             // NAME mapping (givenName, sn, screenName)
             String givenName = firstNonNull(givenNameAttr, screenNameAttr, user.userName);
@@ -458,14 +464,21 @@ public class CSVSCIMImporterV1 {
 
             root.set("schemas", schemas);
 
-            // Debug print request body
+            // Debug print request body + claims
             lastRequestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
 
             if (DEBUG) {
                 System.out.println("\n================ USER CREATE REQUEST ================");
-                System.out.println("User UM_ID: " + user.umId +
-                        "  USERNAME: " + user.userName +
-                        "  SCIM userName: " + scimUserName);
+                System.out.println("User UM_ID          : " + user.umId);
+                System.out.println("Database userName   : " + user.userName);
+                System.out.println("SCIM userName       : " + scimUserName);
+                System.out.println("teacherid (attr)    : " + teacherId);
+                System.out.println("externalId (SCIM)   : " + externalIdVal);
+                System.out.println("givenName (attr)    : " + givenNameAttr);
+                System.out.println("sn (attr)           : " + familyNameAttr);
+                System.out.println("screenName (attr)   : " + screenNameAttr);
+                System.out.println("mail (attr)         : " + mail);
+                System.out.println("------------------- SCIM JSON BODY -----------------");
                 System.out.println(lastRequestBody);
                 System.out.println("=====================================================\n");
             }
@@ -776,7 +789,44 @@ public class CSVSCIMImporterV1 {
         }
     }
 
+    /**
+     * Batching wrapper: splits members into chunks and calls PATCH per batch.
+     */
     private static void patchGroupAddMembers(String groupId, RoleRow role, List<GroupMember> members) {
+        if (members == null || members.isEmpty()) {
+            if (DEBUG) {
+                System.out.println("No members to add for group " + role.roleName +
+                        " (id=" + groupId + ")");
+            }
+            return;
+        }
+
+        int total = members.size();
+        int batchSize = GROUP_PATCH_BATCH_SIZE;
+        int batchCount = (total + batchSize - 1) / batchSize;
+
+        if (DEBUG) {
+            System.out.println("Patching group " + groupId + " with " + total +
+                    " members in " + batchCount + " batch(es) of up to " + batchSize);
+        }
+
+        for (int start = 0; start < total; start += batchSize) {
+            int end = Math.min(start + batchSize, total);
+            List<GroupMember> batch = members.subList(start, end);
+            int batchIndex = (start / batchSize) + 1;
+
+            patchGroupAddMembersBatch(groupId, role, batch, batchIndex, batchCount);
+        }
+    }
+
+    /**
+     * Performs a single PATCH for a batch of members.
+     */
+    private static void patchGroupAddMembersBatch(String groupId,
+                                                  RoleRow role,
+                                                  List<GroupMember> batch,
+                                                  int batchIndex,
+                                                  int batchCount) {
         String lastRequestBody = null;
         String lastResponseBody = null;
         int lastStatus = -1;
@@ -794,7 +844,7 @@ public class CSVSCIMImporterV1 {
             op.put("path", "members");
 
             ArrayNode valueArray = MAPPER.createArrayNode();
-            for (GroupMember m : members) {
+            for (GroupMember m : batch) {
                 ObjectNode mem = MAPPER.createObjectNode();
                 mem.put("value", m.scimUserId);
                 mem.put("display", m.displayName);
@@ -809,11 +859,13 @@ public class CSVSCIMImporterV1 {
             String groupUrl = SCIM_GROUPS_ENDPOINT + "/" + groupId;
 
             if (DEBUG) {
-                System.out.println("\n================ GROUP PATCH (ADD MEMBERS) REQUEST ================");
+                System.out.println("\n================ GROUP PATCH (ADD MEMBERS) BATCH ================");
                 System.out.println("Role UM_ID: " + role.umId + "  ROLE NAME: " + role.roleName);
-                System.out.println("Group SCIM ID: " + groupId + "  Members: " + members.size());
+                System.out.println("Group SCIM ID: " + groupId);
+                System.out.println("Batch " + batchIndex + " of " + batchCount +
+                        "  Members in this batch: " + batch.size());
                 System.out.println(lastRequestBody);
-                System.out.println("===================================================================\n");
+                System.out.println("================================================================\n");
             }
 
             HttpRequest request = HttpRequest.newBuilder()
@@ -830,14 +882,18 @@ public class CSVSCIMImporterV1 {
 
             if (lastStatus >= 200 && lastStatus < 300) {
                 if (DEBUG) {
-                    System.out.println(" -> patched group " + groupId + " with " + members.size() + " members");
+                    System.out.println(" -> patched group " + groupId +
+                            " with " + batch.size() + " members (batch " +
+                            batchIndex + "/" + batchCount + ")");
                 }
             } else {
-                System.err.println("Failed to PATCH members to group " + role.roleName + " HTTP " + lastStatus);
+                System.err.println("Failed to PATCH members (batch " + batchIndex +
+                        "/" + batchCount + ") to group " + role.roleName +
+                        " HTTP " + lastStatus);
                 System.err.println(lastResponseBody);
                 errorRecords.add(new ErrorRecord(
                         "GROUP",
-                        "PATCH_GROUP_ADD_MEMBERS",
+                        "PATCH_GROUP_ADD_MEMBERS_BATCH",
                         null,
                         null,
                         role.umId,
@@ -846,15 +902,16 @@ public class CSVSCIMImporterV1 {
                         lastStatus,
                         lastRequestBody,
                         lastResponseBody,
-                        "HTTP error"
+                        "HTTP error in batch patch"
                 ));
             }
         } catch (Exception e) {
-            String msg = "Exception in patchGroupAddMembers: " + e.getMessage();
+            String msg = "Exception in patchGroupAddMembersBatch (batch " +
+                    batchIndex + "/" + batchCount + "): " + e.getMessage();
             System.err.println(msg);
             errorRecords.add(new ErrorRecord(
                     "GROUP",
-                    "PATCH_GROUP_ADD_MEMBERS",
+                    "PATCH_GROUP_ADD_MEMBERS_BATCH",
                     null,
                     null,
                     role.umId,
@@ -936,7 +993,8 @@ public class CSVSCIMImporterV1 {
                         safeCsv(r.responseBody),
                         safeCsv(r.errorMessage)
                 ));
-                writer.newLine();
+                writer.newLine();   // end of record
+                writer.newLine();   // extra blank line between errors
             }
         } catch (IOException e) {
             System.err.println("Failed to write error log file: " + e.getMessage());
