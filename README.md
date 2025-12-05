@@ -31,10 +31,13 @@ Following configurations has to be there in config.properties file
     # Debug logging (true/false)
     debug.enabled=true
 
+    #group batching
+    group.patch.batch.size=100
 
 
-To build the code, 
-     mvn clean package
-     
-Run the code
-    mvn exec:java
+
+    #To build the code, 
+         mvn clean package
+         
+    #Run the code
+        mvn exec:java
