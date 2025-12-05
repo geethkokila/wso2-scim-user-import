@@ -35,6 +35,7 @@ Following configurations has to be there in config.properties file
     group.patch.batch.size=100
 
 
+Running the code
 
     #To build the code, 
          mvn clean package
