@@ -27,74 +27,78 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.Base64;
 import java.util.Properties;
 
 public class CSVSCIMImporterV1 {
 
-    // ======= LOAD CONFIG FROM config.properties =======
+    // ======= LOAD CONFIG =======
     private static final Properties CONFIG = loadConfig();
 
-    // ======= CONFIG – FROM PROPERTIES =======
-    private static final String USERS_CSV =
-            required("users.csv.path");
-    private static final String ROLES_CSV =
-            required("roles.csv.path");
-    private static final String USER_ATTRIBUTES_CSV =
-            required("userAttributes.csv.path");
-    private static final String USER_ROLE_MAPPING_CSV =
-            required("userRoleMappings.csv.path");
+    // ======= CSV PATHS =======
+    private static final String USERS_CSV = required("users.csv.path");
+    private static final String ROLES_CSV = required("roles.csv.path");
+    private static final String USER_ATTRIBUTES_CSV = required("userAttributes.csv.path");
+    private static final String USER_ROLE_MAPPING_CSV = required("userRoleMappings.csv.path");
 
+    // Output files
     private static final String EXISTING_USERS_OUT =
             CONFIG.getProperty("existingUsers.out.path", "existing-users.csv");
-    private static final String ERROR_LOG_OUT =
-            CONFIG.getProperty("errorLog.out.path", "import-errors.csv");
 
-    // WSO2 IS base URL
-    private static final String BASE_URL =
-            required("baseUrl");
+    private static final String ERROR_LOG_USER_OUT =
+            CONFIG.getProperty("errorLog.user.path", "import-errors-user.csv");
+    private static final String ERROR_LOG_GROUP_OUT =
+            CONFIG.getProperty("errorLog.group.path", "import-errors-group.csv");
 
-    // Tenant domain (e.g. test.com)
-    private static final String TENANT_DOMAIN =
-            required("tenantDomain");
+    // WSO2 IS base URL + tenant
+    private static final String BASE_URL = required("baseUrl");
+    private static final String TENANT_DOMAIN = required("tenantDomain");
 
-    // SCIM endpoints for tenant: /t/<tenant>/scim2/...
     private static final String SCIM_USERS_ENDPOINT =
             BASE_URL + "/t/" + TENANT_DOMAIN + "/scim2/Users";
     private static final String SCIM_GROUPS_ENDPOINT =
             BASE_URL + "/t/" + TENANT_DOMAIN + "/scim2/Groups";
 
-    // Admin credentials for SCIM calls (tenant admin if needed)
-    private static final String SCIM_USERNAME =
-            required("scim.username");
-    private static final String SCIM_PASSWORD =
-            required("scim.password");
+    // SCIM auth
+    private static final String SCIM_USERNAME = required("scim.username");
+    private static final String SCIM_PASSWORD = required("scim.password");
 
-    // Target user store domain (EUM)
+    // Target userstore
     private static final String USER_STORE_DOMAIN =
             CONFIG.getProperty("userStore.domain", "EUM");
-
-    // Use same store for groups
     private static final String GROUP_STORE_DOMAIN = USER_STORE_DOMAIN;
 
-    // Max members per PATCH to avoid huge payloads
+    // Group patch batch size
     private static final int GROUP_PATCH_BATCH_SIZE =
             Integer.parseInt(CONFIG.getProperty("group.patch.batch.size", "200"));
 
-    // Debug flag (prints request bodies, etc.)
+    // Retry settings
+    private static final int RETRY_MAX_ATTEMPTS =
+            Integer.parseInt(CONFIG.getProperty("retry.maxAttempts", "3"));
+    private static final long RETRY_BASE_DELAY_MS =
+            Long.parseLong(CONFIG.getProperty("retry.baseDelayMs", "500"));
+    private static final long RETRY_MAX_DELAY_MS =
+            Long.parseLong(CONFIG.getProperty("retry.maxDelayMs", "5000"));
+    private static final long RETRY_JITTER_MS =
+            Long.parseLong(CONFIG.getProperty("retry.jitterMs", "200"));
+
+    // Debug
     private static final boolean DEBUG =
             Boolean.parseBoolean(CONFIG.getProperty("debug.enabled", "true"));
 
-    // HttpClient that trusts ALL SSL certificates (dev only!)
+    // HTTP + JSON
     private static final HttpClient HTTP_CLIENT;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    // Collect users that already existed in IS
+    // Track existing users (still useful)
     private static final List<ExistingUserRecord> existingUsers = new ArrayList<>();
 
-    // Collect all errors to write at the end
-    private static final List<ErrorRecord> errorRecords = new ArrayList<>();
+    // Error log writers (init-on-first-write)
+    private static boolean userErrorHeaderWritten = false;
+    private static boolean groupErrorHeaderWritten = false;
 
     static {
         try {
@@ -118,127 +122,117 @@ public class CSVSCIMImporterV1 {
             System.out.println("User attributes keys: " + userAttributes.size());
             System.out.println("User-role mappings: " + mappings.size());
 
-            // Map: um_user_id -> SCIM user id
-            Map<String, String> umUserIdToScimId = new HashMap<>();
+            // 1) Ensure all groups exist first
+            Map<String, String> roleIdToGroupId = new HashMap<>();
+            System.out.println("Ensuring SCIM groups exist...");
+            for (RoleRow role : roles.values()) {
+                String groupId = findScimGroupIdByDisplayName(role.roleName);
+                if (groupId == null) {
+                    groupId = createScimGroup(role);
+                }
+                if (groupId != null) {
+                    roleIdToGroupId.put(role.umId, groupId);
+                }
+            }
 
-            // 1) Create users first (or reuse existing)
-            System.out.println("Creating SCIM users (or reusing existing)...");
+            // 2) user -> roles map
+            Map<String, List<RoleRow>> userIdToRoles = new HashMap<>();
+            for (UserRoleMapping mapping : mappings) {
+                RoleRow role = roles.get(mapping.umRoleId);
+                if (role == null) continue;
+                userIdToRoles.computeIfAbsent(mapping.umUserId, k -> new ArrayList<>()).add(role);
+            }
+
+            // 3) For each user: create/reuse user, then patch into groups
+            System.out.println("Creating SCIM users and patching them into groups...");
             for (UserRow user : users.values()) {
                 Map<String, String> attrs = userAttributes.getOrDefault(user.umId, Collections.emptyMap());
-                String scimUserId = null;
-                try {
-                    scimUserId = createScimUser(user, attrs);
-                } catch (Exception e) {
-                    String errorMsg = "Unexpected error in createScimUser: " + e.getMessage();
-                    System.err.println(errorMsg);
-                    errorRecords.add(ErrorRecord.forException(
-                            "USER",
-                            "CREATE_USER",
-                            user.umId,
-                            user.userName,
-                            null,
-                            null,
-                            SCIM_USERS_ENDPOINT,
-                            null,
-                            null,
-                            errorMsg
-                    ));
-                }
 
+                String scimUserId = createScimUser(user, attrs);
                 if (scimUserId == null) {
-                    System.out.println("Skipping roles for user " + user.userName + " (SCIM id is null)");
+                    System.out.println("Skipping group patching for user " + user.userName +
+                            " (SCIM id is null)");
                     continue;
                 }
 
-                umUserIdToScimId.put(user.umId, scimUserId);
-            }
+                List<RoleRow> userRoles = userIdToRoles.get(user.umId);
+                if (userRoles == null || userRoles.isEmpty()) continue;
 
-            // 2) Build role -> member list based on mappings (using SCIM user IDs)
-            Map<String, List<GroupMember>> roleIdToMembers = new HashMap<>();
-
-            for (UserRoleMapping mapping : mappings) {
-                String scimUserId = umUserIdToScimId.get(mapping.umUserId);
-                if (scimUserId == null) {
-                    System.out.println("WARN: No SCIM user for um_user_id=" + mapping.umUserId);
-                    continue;
-                }
-
-                UserRow userRow = users.get(mapping.umUserId);
-                Map<String, String> attrs = userAttributes.getOrDefault(mapping.umUserId, Collections.emptyMap());
-
-                String screenName = attrs.getOrDefault("screenName",
-                        userRow != null ? userRow.userName : ("user-" + mapping.umUserId));
-
+                String screenName = attrs.getOrDefault("screenName", user.userName);
                 GroupMember member = new GroupMember(scimUserId, screenName);
 
-                roleIdToMembers
-                        .computeIfAbsent(mapping.umRoleId, k -> new ArrayList<>())
-                        .add(member);
-            }
-
-            // 3) Ensure groups exist, then update them with members (PATCH, with batching)
-            System.out.println("Creating/Updating SCIM groups (roles) with members...");
-            for (RoleRow role : roles.values()) {
-                List<GroupMember> members = roleIdToMembers.get(role.umId);
-                if (members == null || members.isEmpty()) {
-                    if (DEBUG) {
-                        System.out.println("Skipping role " + role.roleName +
-                                " (um_id=" + role.umId + ") - no members in mappings");
+                for (RoleRow role : userRoles) {
+                    String groupId = roleIdToGroupId.get(role.umId);
+                    if (groupId == null) {
+                        logErrorImmediately(new ErrorRecord(
+                                nowIsoUtc(),
+                                "GROUP",
+                                "PATCH_GROUP_ADD_MEMBER",
+                                1,
+                                RETRY_MAX_ATTEMPTS,
+                                0,
+                                "missingGroupId",
+                                user.umId,
+                                user.userName,
+                                role.umId,
+                                role.roleName,
+                                SCIM_GROUPS_ENDPOINT,
+                                null,
+                                null,
+                                null,
+                                "No SCIM group id found for role"
+                        ));
+                        continue;
                     }
-                    continue;
-                }
-
-                try {
-                    ensureGroupAndAddMembers(role, members);
-                } catch (Exception e) {
-                    String errorMsg = "Unexpected error in ensureGroupAndAddMembers: " + e.getMessage();
-                    System.err.println(errorMsg);
-                    errorRecords.add(ErrorRecord.forException(
-                            "GROUP",
-                            "ENSURE_GROUP_AND_ADD_MEMBERS",
-                            null,
-                            null,
-                            role.umId,
-                            role.roleName,
-                            SCIM_GROUPS_ENDPOINT,
-                            null,
-                            null,
-                            errorMsg
-                    ));
+                    patchGroupAddMembers(groupId, role, Collections.singletonList(member), user);
                 }
             }
 
-            // 4) Write existing users and errors to files
+            // existing users output
             writeExistingUsersToFile(EXISTING_USERS_OUT);
-            writeErrorRecordsToFile(ERROR_LOG_OUT);
-
             System.out.println("Import finished.");
             System.out.println("Existing users written to: " + EXISTING_USERS_OUT);
-            System.out.println("Errors written to: " + ERROR_LOG_OUT);
+            System.out.println("Errors (USER) written to: " + ERROR_LOG_USER_OUT);
+            System.out.println("Errors (GROUP) written to: " + ERROR_LOG_GROUP_OUT);
+
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
     // ===================================================================================
-    // CONFIG LOADING
+    // CONFIG LOADING (supports -Dconfig.file or CONFIG_FILE, then classpath fallback)
     // ===================================================================================
 
     private static Properties loadConfig() {
         Properties props = new Properties();
-        try (InputStream in = CSVSCIMImporterV1.class
-                .getClassLoader()
-                .getResourceAsStream("config.properties")) {
 
-            if (in == null) {
-                throw new IllegalStateException(
-                        "config.properties not found on classpath. " +
-                                "Place it in src/main/resources.");
+        String configPath = System.getProperty("config.file");
+        if (configPath == null || configPath.isBlank()) {
+            configPath = System.getenv("CONFIG_FILE");
+        }
+
+        try {
+            if (configPath != null && !configPath.isBlank()) {
+                System.out.println("Loading config.properties from path: " + configPath);
+                try (InputStream in = Files.newInputStream(Path.of(configPath))) {
+                    props.load(in);
+                }
+            } else {
+                System.out.println("Loading config.properties from classpath");
+                try (InputStream in = CSVSCIMImporterV1.class.getClassLoader().getResourceAsStream("config.properties")) {
+                    if (in == null) {
+                        throw new IllegalStateException(
+                                "config.properties not found on classpath and no config.file/CONFIG_FILE specified."
+                        );
+                    }
+                    props.load(in);
+                }
             }
-            props.load(in);
         } catch (IOException e) {
             throw new RuntimeException("Failed to load config.properties", e);
         }
+
         return props;
     }
 
@@ -277,23 +271,15 @@ public class CSVSCIMImporterV1 {
 
     private static Map<String, UserRow> loadUsers(String path) throws IOException {
         Map<String, UserRow> map = new LinkedHashMap<>();
-
         try (Reader reader = new FileReader(path, StandardCharsets.UTF_8);
-             CSVParser parser = CSVFormat.DEFAULT
-                     .withFirstRecordAsHeader()
-                     .withIgnoreSurroundingSpaces()
-                     .parse(reader)) {
+             CSVParser parser = CSVFormat.DEFAULT.withFirstRecordAsHeader().withIgnoreSurroundingSpaces().parse(reader)) {
 
             for (CSVRecord record : parser) {
                 UserRow u = new UserRow();
                 u.umId = record.get("um_id").trim();
                 u.userName = record.get("um_user_name").trim();
                 u.password = normalizeNull(record.get("um_user_password"));
-                u.salt = normalizeNull(record.get("um_salt_value"));
-                u.requireChange = normalizeNull(record.get("um_require_change"));
-                u.changedTime = normalizeNull(record.get("um_changed_time"));
                 u.tenantId = normalizeNull(record.get("um_tenant_id"));
-
                 map.put(u.umId, u);
             }
         }
@@ -302,20 +288,13 @@ public class CSVSCIMImporterV1 {
 
     private static Map<String, RoleRow> loadRoles(String path) throws IOException {
         Map<String, RoleRow> map = new LinkedHashMap<>();
-
         try (Reader reader = new FileReader(path, StandardCharsets.UTF_8);
-             CSVParser parser = CSVFormat.DEFAULT
-                     .withFirstRecordAsHeader()
-                     .withIgnoreSurroundingSpaces()
-                     .parse(reader)) {
+             CSVParser parser = CSVFormat.DEFAULT.withFirstRecordAsHeader().withIgnoreSurroundingSpaces().parse(reader)) {
 
             for (CSVRecord record : parser) {
                 RoleRow r = new RoleRow();
                 r.umId = record.get("um_id").trim();
                 r.roleName = record.get("um_role_name").trim();
-                r.tenantId = normalizeNull(record.get("um_tenant_id"));
-                r.sharedRole = normalizeNull(record.get("um_shared_role"));
-
                 map.put(r.umId, r);
             }
         }
@@ -324,20 +303,14 @@ public class CSVSCIMImporterV1 {
 
     private static Map<String, Map<String, String>> loadUserAttributes(String path) throws IOException {
         Map<String, Map<String, String>> map = new HashMap<>();
-
         try (Reader reader = new FileReader(path, StandardCharsets.UTF_8);
-             CSVParser parser = CSVFormat.DEFAULT
-                     .withFirstRecordAsHeader()
-                     .withIgnoreSurroundingSpaces()
-                     .parse(reader)) {
+             CSVParser parser = CSVFormat.DEFAULT.withFirstRecordAsHeader().withIgnoreSurroundingSpaces().parse(reader)) {
 
             for (CSVRecord record : parser) {
                 String attrName = record.get("um_attr_name").trim();
                 String attrValue = normalizeNull(record.get("um_attr_value"));
                 String umUserId = record.get("um_user_id").trim();
-
-                map.computeIfAbsent(umUserId, k -> new HashMap<>())
-                        .put(attrName, attrValue);
+                map.computeIfAbsent(umUserId, k -> new HashMap<>()).put(attrName, attrValue);
             }
         }
         return map;
@@ -345,18 +318,13 @@ public class CSVSCIMImporterV1 {
 
     private static List<UserRoleMapping> loadUserRoleMappings(String path) throws IOException {
         List<UserRoleMapping> list = new ArrayList<>();
-
         try (Reader reader = new FileReader(path, StandardCharsets.UTF_8);
-             CSVParser parser = CSVFormat.DEFAULT
-                     .withFirstRecordAsHeader()
-                     .withIgnoreSurroundingSpaces()
-                     .parse(reader)) {
+             CSVParser parser = CSVFormat.DEFAULT.withFirstRecordAsHeader().withIgnoreSurroundingSpaces().parse(reader)) {
 
             for (CSVRecord record : parser) {
                 UserRoleMapping m = new UserRoleMapping();
                 m.umUserId = record.get("um_user_id").trim();
                 m.umRoleId = record.get("um_role_id").trim();
-                m.tenantId = normalizeNull(record.get("um_tenant_id"));
                 list.add(m);
             }
         }
@@ -371,571 +339,608 @@ public class CSVSCIMImporterV1 {
     }
 
     // ===================================================================================
-    // SCIM: Users (using only teacherid, givenName, screenName, mail, sn)
+    // SCIM: Users (teacherid, givenName, screenName, mail, sn)
     // ===================================================================================
 
     private static String createScimUser(UserRow user, Map<String, String> attrs) {
-        String scimId = null;
-        String lastRequestBody = null;
-        String lastResponseBody = null;
-        int lastStatus = -1;
+        // 1) Check if exists
+        String existingId = findScimUserIdByUserName(user.userName);
+        if (existingId != null) {
+            existingUsers.add(new ExistingUserRecord(user.umId, user.userName, existingId));
+            return existingId;
+        }
 
-        try {
-            // 1) Check if username already exists in IS (in EUM)
-            scimId = findScimUserIdByUserName(user.userName);
-            if (scimId != null) {
-                if (DEBUG) {
-                    System.out.println("User already exists in IS (EUM): " + user.userName +
-                            " -> SCIM id = " + scimId);
-                }
-                existingUsers.add(new ExistingUserRecord(user.umId, user.userName, scimId));
-                return scimId;
-            }
+        String teacherId = attrs.get("teacherid");
+        String givenNameAttr = attrs.get("givenName");
+        String familyNameAttr = attrs.get("sn");
+        String screenNameAttr = attrs.get("screenName");
+        String mail = attrs.get("mail");
 
-            // 2) Build SCIM user create payload from user + attrs
-            ObjectNode root = MAPPER.createObjectNode();
+        ObjectNode root = MAPPER.createObjectNode();
 
-            ArrayNode schemas = MAPPER.createArrayNode();
-            schemas.add("urn:ietf:params:scim:schemas:core:2.0:User");
+        ArrayNode schemas = MAPPER.createArrayNode();
+        schemas.add("urn:ietf:params:scim:schemas:core:2.0:User");
 
-            String enterpriseUrn = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User";
-            boolean hasEnterpriseExtension = false;
+        String enterpriseUrn = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User";
 
-            // Basic username & password; send to EUM user store
-            String scimUserName = withUserStoreDomain(user.userName);
-            root.put("userName", scimUserName);
+        String scimUserName = withUserStoreDomain(user.userName);
+        root.put("userName", scimUserName);
 
-            if (user.password != null && !user.password.isBlank()) {
-                root.put("password", user.password);
-            }
+        if (user.password != null && !user.password.isBlank()) {
+            root.put("password", user.password);
+        }
 
-            // ==== ONLY THESE ATTRIBUTES ARE USED NOW ====
-            String teacherId      = attrs.get("teacherid");
-            String givenNameAttr  = attrs.get("givenName");
-            String familyNameAttr = attrs.get("sn");
-            String screenNameAttr = attrs.get("screenName");
-            String mail           = attrs.get("mail");
-            // ============================================
+        // externalId MUST be teacherid (if missing, we do not set it)
+        if (teacherId != null && !teacherId.isBlank()) {
+            root.put("externalId", teacherId);
+        }
 
-            // externalId should carry teacherid; fallback to UM_ID if teacherid is missing
-            String externalIdVal =
-                    (teacherId != null && !teacherId.isBlank()) ? teacherId : user.umId;
-            root.put("externalId", externalIdVal);
+        // name
+        String givenName = firstNonNull(givenNameAttr, screenNameAttr, user.userName);
+        String familyName = firstNonNull(familyNameAttr, givenNameAttr, screenNameAttr, user.userName);
 
-            // NAME mapping (givenName, sn, screenName)
-            String givenName = firstNonNull(givenNameAttr, screenNameAttr, user.userName);
-            String familyName = firstNonNull(familyNameAttr, givenNameAttr, screenNameAttr, user.userName);
+        ObjectNode name = MAPPER.createObjectNode();
+        name.put("givenName", givenName);
+        name.put("familyName", familyName);
+        root.set("name", name);
 
-            ObjectNode name = MAPPER.createObjectNode();
-            if (givenName != null) {
-                name.put("givenName", givenName);
-            }
-            if (familyName != null) {
-                name.put("familyName", familyName);
-            }
-            root.set("name", name);
+        // primary email only if contains "@"
+        if (mail != null && !mail.isBlank() && mail.contains("@")) {
+            ArrayNode emails = MAPPER.createArrayNode();
+            ObjectNode primaryEmail = MAPPER.createObjectNode();
+            primaryEmail.put("value", mail);
+            primaryEmail.put("primary", true);
+            emails.add(primaryEmail);
+            root.set("emails", emails);
+        } else if (DEBUG) {
+            System.out.println("Skipping email for user (invalid or missing '@'): " + mail);
+        }
 
-            // EMAIL mapping (mail)
-            if (mail != null && !mail.isBlank()) {
-                ArrayNode emails = MAPPER.createArrayNode();
-                ObjectNode emailWork = MAPPER.createObjectNode();
-                emailWork.put("type", "work");
-                emailWork.put("value", mail);
-                emails.add(emailWork);
-                root.set("emails", emails);
-            }
+        // nickName from screenName
+        if (screenNameAttr != null && !screenNameAttr.isBlank()) {
+            root.put("nickName", screenNameAttr);
+        }
 
-            // Optionally store screenName as nickName
-            if (screenNameAttr != null && !screenNameAttr.isBlank()) {
-                root.put("nickName", screenNameAttr);
-            }
-
-            // Enterprise extension: ONLY teacherid -> employeeNumber
+        // enterprise extension with employeeNumber = teacherid
+        if (teacherId != null && !teacherId.isBlank()) {
             ObjectNode enterprise = MAPPER.createObjectNode();
-            if (teacherId != null && !teacherId.isBlank()) {
-                enterprise.put("employeeNumber", teacherId);
-                hasEnterpriseExtension = true;
-            }
+            enterprise.put("employeeNumber", teacherId);
+            schemas.add(enterpriseUrn);
+            root.set(enterpriseUrn, enterprise);
+        }
 
-            if (hasEnterpriseExtension) {
-                schemas.add(enterpriseUrn);
-                root.set(enterpriseUrn, enterprise);
-            }
+        root.set("schemas", schemas);
 
-            root.set("schemas", schemas);
-
-            // Debug print request body + claims
-            lastRequestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
-
-            if (DEBUG) {
-                System.out.println("\n================ USER CREATE REQUEST ================");
-                System.out.println("User UM_ID          : " + user.umId);
-                System.out.println("Database userName   : " + user.userName);
-                System.out.println("SCIM userName       : " + scimUserName);
-                System.out.println("teacherid (attr)    : " + teacherId);
-                System.out.println("externalId (SCIM)   : " + externalIdVal);
-                System.out.println("givenName (attr)    : " + givenNameAttr);
-                System.out.println("sn (attr)           : " + familyNameAttr);
-                System.out.println("screenName (attr)   : " + screenNameAttr);
-                System.out.println("mail (attr)         : " + mail);
-                System.out.println("------------------- SCIM JSON BODY -----------------");
-                System.out.println(lastRequestBody);
-                System.out.println("=====================================================\n");
-            }
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(SCIM_USERS_ENDPOINT))
-                    .header("Content-Type", "application/scim+json")
-                    .header("Accept", "application/scim+json")
-                    .header("Authorization", basicAuth())
-                    .POST(HttpRequest.BodyPublishers.ofString(lastRequestBody, StandardCharsets.UTF_8))
-                    .build();
-
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-            lastStatus = response.statusCode();
-            lastResponseBody = response.body();
-
-            if (lastStatus >= 200 && lastStatus < 300) {
-                ObjectNode respJson = (ObjectNode) MAPPER.readTree(lastResponseBody);
-                scimId = respJson.get("id").asText();
-                if (DEBUG) {
-                    System.out.println(" -> created SCIM user id=" + scimId);
-                }
-                return scimId;
-            } else {
-                System.err.println("Failed to create user " + user.userName + " HTTP " + lastStatus);
-                System.err.println(lastResponseBody);
-                errorRecords.add(new ErrorRecord(
-                        "USER",
-                        "CREATE_USER",
-                        user.umId,
-                        user.userName,
-                        null,
-                        null,
-                        SCIM_USERS_ENDPOINT,
-                        lastStatus,
-                        lastRequestBody,
-                        lastResponseBody,
-                        "HTTP error"
-                ));
-                return null;
-            }
-
+        String requestBody;
+        try {
+            requestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
         } catch (Exception e) {
-            String msg = "Exception in createScimUser: " + e.getMessage();
-            System.err.println(msg);
-            errorRecords.add(new ErrorRecord(
+            logErrorImmediately(new ErrorRecord(
+                    nowIsoUtc(),
                     "USER",
                     "CREATE_USER",
+                    1,
+                    RETRY_MAX_ATTEMPTS,
+                    0,
+                    "serializationError",
                     user.umId,
                     user.userName,
                     null,
                     null,
                     SCIM_USERS_ENDPOINT,
-                    lastStatus,
-                    lastRequestBody,
-                    lastResponseBody,
-                    msg
+                    null,
+                    null,
+                    null,
+                    e.getMessage()
             ));
             return null;
         }
+
+        if (DEBUG) {
+            System.out.println("\n================ USER CREATE REQUEST ================");
+            System.out.println("User UM_ID          : " + user.umId);
+            System.out.println("Database userName   : " + user.userName);
+            System.out.println("SCIM userName       : " + scimUserName);
+            System.out.println("teacherid (attr)    : " + teacherId);
+            System.out.println("externalId (SCIM)   : " + teacherId);
+            System.out.println("givenName (attr)    : " + givenNameAttr);
+            System.out.println("sn (attr)           : " + familyNameAttr);
+            System.out.println("screenName (attr)   : " + screenNameAttr);
+            System.out.println("mail (attr)         : " + mail);
+            System.out.println("------------------- SCIM JSON BODY -----------------");
+            System.out.println(requestBody);
+            System.out.println("=====================================================\n");
+        }
+
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(SCIM_USERS_ENDPOINT))
+                .header("Content-Type", "application/scim+json")
+                .header("Accept", "application/scim+json")
+                .header("Authorization", basicAuth())
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
+                .build();
+
+        RetryResult<HttpResponse<String>> rr = sendWithRetry(req, "USER", "CREATE_USER", user, null, null, requestBody);
+
+        if (rr.response != null && rr.response.statusCode() >= 200 && rr.response.statusCode() < 300) {
+            try {
+                ObjectNode respJson = (ObjectNode) MAPPER.readTree(rr.response.body());
+                return respJson.get("id").asText();
+            } catch (Exception e) {
+                logErrorImmediately(new ErrorRecord(
+                        nowIsoUtc(),
+                        "USER",
+                        "CREATE_USER_PARSE_RESPONSE",
+                        rr.attempt,
+                        rr.maxAttempts,
+                        rr.lastBackoffMs,
+                        rr.retryableReason,
+                        user.umId,
+                        user.userName,
+                        null,
+                        null,
+                        SCIM_USERS_ENDPOINT,
+                        rr.response.statusCode(),
+                        requestBody,
+                        rr.response.body(),
+                        e.getMessage()
+                ));
+                return null;
+            }
+        }
+
+        // Non-success already logged by sendWithRetry (final failure), return null
+        return null;
     }
 
-    /**
-     * Search SCIM by userName in EUM:
-     * GET /scim2/Users?filter=userName eq "EUM/xxx"
-     */
     private static String findScimUserIdByUserName(String userName) {
         String scimUserName = withUserStoreDomain(userName);
         String filter = "userName eq \"" + scimUserName.replace("\"", "\\\"") + "\"";
-        String url = SCIM_USERS_ENDPOINT + "?filter=" +
-                URLEncoder.encode(filter, StandardCharsets.UTF_8);
+        String url = SCIM_USERS_ENDPOINT + "?filter=" + URLEncoder.encode(filter, StandardCharsets.UTF_8);
 
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("Accept", "application/scim+json")
-                    .header("Authorization", basicAuth())
-                    .GET()
-                    .build();
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Accept", "application/scim+json")
+                .header("Authorization", basicAuth())
+                .GET()
+                .build();
 
-            HttpResponse<String> response =
-                    HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+        RetryResult<HttpResponse<String>> rr = sendWithRetry(req, "USER", "SEARCH_USER", null, null, userName, null);
 
-            int status = response.statusCode();
-            if (status >= 200 && status < 300) {
-                JsonNode root = MAPPER.readTree(response.body());
+        if (rr.response != null && rr.response.statusCode() >= 200 && rr.response.statusCode() < 300) {
+            try {
+                JsonNode root = MAPPER.readTree(rr.response.body());
                 JsonNode totalResultsNode = root.get("totalResults");
                 if (totalResultsNode != null && totalResultsNode.asInt() > 0) {
                     JsonNode resources = root.get("Resources");
                     if (resources != null && resources.isArray() && resources.size() > 0) {
-                        JsonNode first = resources.get(0);
-                        JsonNode idNode = first.get("id");
-                        if (idNode != null && !idNode.asText().isBlank()) {
-                            return idNode.asText();
-                        }
+                        JsonNode idNode = resources.get(0).get("id");
+                        if (idNode != null && !idNode.asText().isBlank()) return idNode.asText();
                     }
                 }
-                return null;
-            } else {
-                System.err.println("User search failed for " + scimUserName + " HTTP " + status);
-                System.err.println(response.body());
-                errorRecords.add(new ErrorRecord(
+            } catch (Exception e) {
+                logErrorImmediately(new ErrorRecord(
+                        nowIsoUtc(),
                         "USER",
-                        "SEARCH_USER",
+                        "SEARCH_USER_PARSE_RESPONSE",
+                        rr.attempt,
+                        rr.maxAttempts,
+                        rr.lastBackoffMs,
+                        rr.retryableReason,
                         null,
                         userName,
                         null,
                         null,
                         url,
-                        status,
+                        rr.response.statusCode(),
                         null,
-                        response.body(),
-                        "HTTP error in user search"
+                        rr.response.body(),
+                        e.getMessage()
                 ));
-                return null;
             }
-        } catch (Exception e) {
-            String msg = "Exception in findScimUserIdByUserName: " + e.getMessage();
-            System.err.println(msg);
-            errorRecords.add(new ErrorRecord(
-                    "USER",
-                    "SEARCH_USER",
-                    null,
-                    userName,
-                    null,
-                    null,
-                    null,
-                    -1,
-                    null,
-                    null,
-                    msg
-            ));
-            return null;
         }
+        return null;
     }
 
     // ===================================================================================
-    // SCIM: Groups (Roles) - create/update with members in same user store
+    // SCIM: Groups (create then patch per user)
     // ===================================================================================
-
-    private static void ensureGroupAndAddMembers(RoleRow role, List<GroupMember> members) {
-        String groupId = findScimGroupIdByDisplayName(role.roleName);
-
-        if (groupId == null) {
-            groupId = createScimGroup(role);
-            if (groupId == null) {
-                System.err.println("Cannot patch members for role " + role.roleName +
-                        " because group creation failed.");
-                return;
-            }
-        }
-
-        patchGroupAddMembers(groupId, role, members);
-    }
 
     private static String findScimGroupIdByDisplayName(String roleName) {
         String displayName = withGroupStoreDomain(roleName);
         String filter = "displayName eq \"" + displayName.replace("\"", "\\\"") + "\"";
-        String url = SCIM_GROUPS_ENDPOINT + "?filter=" +
-                URLEncoder.encode(filter, StandardCharsets.UTF_8);
+        String url = SCIM_GROUPS_ENDPOINT + "?filter=" + URLEncoder.encode(filter, StandardCharsets.UTF_8);
 
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("Accept", "application/scim+json")
-                    .header("Authorization", basicAuth())
-                    .GET()
-                    .build();
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Accept", "application/scim+json")
+                .header("Authorization", basicAuth())
+                .GET()
+                .build();
 
-            HttpResponse<String> response =
-                    HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+        RetryResult<HttpResponse<String>> rr = sendWithRetry(req, "GROUP", "SEARCH_GROUP", null, roleName, null, null);
 
-            int status = response.statusCode();
-            if (status >= 200 && status < 300) {
-                JsonNode root = MAPPER.readTree(response.body());
+        if (rr.response != null && rr.response.statusCode() >= 200 && rr.response.statusCode() < 300) {
+            try {
+                JsonNode root = MAPPER.readTree(rr.response.body());
                 JsonNode totalResultsNode = root.get("totalResults");
                 if (totalResultsNode != null && totalResultsNode.asInt() > 0) {
                     JsonNode resources = root.get("Resources");
                     if (resources != null && resources.isArray() && resources.size() > 0) {
-                        JsonNode first = resources.get(0);
-                        JsonNode idNode = first.get("id");
-                        if (idNode != null && !idNode.asText().isBlank()) {
-                            return idNode.asText();
-                        }
+                        JsonNode idNode = resources.get(0).get("id");
+                        if (idNode != null && !idNode.asText().isBlank()) return idNode.asText();
                     }
                 }
-                return null;
-            } else {
-                System.err.println("Group search failed for " + displayName + " HTTP " + status);
-                System.err.println(response.body());
-                errorRecords.add(new ErrorRecord(
+            } catch (Exception e) {
+                logErrorImmediately(new ErrorRecord(
+                        nowIsoUtc(),
                         "GROUP",
-                        "SEARCH_GROUP",
+                        "SEARCH_GROUP_PARSE_RESPONSE",
+                        rr.attempt,
+                        rr.maxAttempts,
+                        rr.lastBackoffMs,
+                        rr.retryableReason,
                         null,
                         null,
                         null,
                         roleName,
                         url,
-                        status,
+                        rr.response.statusCode(),
                         null,
-                        response.body(),
-                        "HTTP error in group search"
+                        rr.response.body(),
+                        e.getMessage()
                 ));
-                return null;
             }
-        } catch (Exception e) {
-            String msg = "Exception in findScimGroupIdByDisplayName: " + e.getMessage();
-            System.err.println(msg);
-            errorRecords.add(new ErrorRecord(
-                    "GROUP",
-                    "SEARCH_GROUP",
-                    null,
-                    null,
-                    null,
-                    roleName,
-                    null,
-                    -1,
-                    null,
-                    null,
-                    msg
-            ));
-            return null;
         }
+        return null;
     }
 
     private static String createScimGroup(RoleRow role) {
-        String lastRequestBody = null;
-        String lastResponseBody = null;
-        int lastStatus = -1;
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode schemas = MAPPER.createArrayNode();
+        schemas.add("urn:ietf:params:scim:schemas:core:2.0:Group");
+        root.set("schemas", schemas);
 
+        String displayName = withGroupStoreDomain(role.roleName);
+        root.put("displayName", displayName);
+
+        String requestBody;
         try {
-            ObjectNode root = MAPPER.createObjectNode();
-
-            ArrayNode schemas = MAPPER.createArrayNode();
-            schemas.add("urn:ietf:params:scim:schemas:core:2.0:Group");
-            root.set("schemas", schemas);
-
-            // Create group in same user store as users: EUM/<roleName>
-            String displayName = withGroupStoreDomain(role.roleName);
-            root.put("displayName", displayName);
-
-            lastRequestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
-
-            if (DEBUG) {
-                System.out.println("\n================ GROUP CREATE (EMPTY) REQUEST ================");
-                System.out.println("Role UM_ID: " + role.umId +
-                        "  ROLE NAME: " + role.roleName +
-                        "  DISPLAY NAME: " + displayName);
-                System.out.println(lastRequestBody);
-                System.out.println("================================================================\n");
-            }
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(SCIM_GROUPS_ENDPOINT))
-                    .header("Content-Type", "application/scim+json")
-                    .header("Accept", "application/scim+json")
-                    .header("Authorization", basicAuth())
-                    .POST(HttpRequest.BodyPublishers.ofString(lastRequestBody, StandardCharsets.UTF_8))
-                    .build();
-
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-            lastStatus = response.statusCode();
-            lastResponseBody = response.body();
-
-            if (lastStatus >= 200 && lastStatus < 300) {
-                ObjectNode respJson = (ObjectNode) MAPPER.readTree(lastResponseBody);
-                String scimGroupId = respJson.get("id").asText();
-                if (DEBUG) {
-                    System.out.println(" -> created SCIM group id=" + scimGroupId +
-                            " displayName=" + displayName);
-                }
-                return scimGroupId;
-            } else {
-                System.err.println("Failed to create group " + displayName + " HTTP " + lastStatus);
-                System.err.println(lastResponseBody);
-                errorRecords.add(new ErrorRecord(
-                        "GROUP",
-                        "CREATE_GROUP",
-                        null,
-                        null,
-                        role.umId,
-                        role.roleName,
-                        SCIM_GROUPS_ENDPOINT,
-                        lastStatus,
-                        lastRequestBody,
-                        lastResponseBody,
-                        "HTTP error"
-                ));
-                return null;
-            }
+            requestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
         } catch (Exception e) {
-            String msg = "Exception in createScimGroup: " + e.getMessage();
-            System.err.println(msg);
-            errorRecords.add(new ErrorRecord(
+            logErrorImmediately(new ErrorRecord(
+                    nowIsoUtc(),
                     "GROUP",
-                    "CREATE_GROUP",
+                    "CREATE_GROUP_SERIALIZE",
+                    1,
+                    RETRY_MAX_ATTEMPTS,
+                    0,
+                    "serializationError",
                     null,
                     null,
                     role.umId,
                     role.roleName,
                     SCIM_GROUPS_ENDPOINT,
-                    lastStatus,
-                    lastRequestBody,
-                    lastResponseBody,
-                    msg
+                    null,
+                    null,
+                    null,
+                    e.getMessage()
             ));
             return null;
         }
-    }
-
-    /**
-     * Batching wrapper: splits members into chunks and calls PATCH per batch.
-     */
-    private static void patchGroupAddMembers(String groupId, RoleRow role, List<GroupMember> members) {
-        if (members == null || members.isEmpty()) {
-            if (DEBUG) {
-                System.out.println("No members to add for group " + role.roleName +
-                        " (id=" + groupId + ")");
-            }
-            return;
-        }
-
-        int total = members.size();
-        int batchSize = GROUP_PATCH_BATCH_SIZE;
-        int batchCount = (total + batchSize - 1) / batchSize;
 
         if (DEBUG) {
-            System.out.println("Patching group " + groupId + " with " + total +
-                    " members in " + batchCount + " batch(es) of up to " + batchSize);
+            System.out.println("\n================ GROUP CREATE REQUEST ================");
+            System.out.println("Role UM_ID: " + role.umId + " ROLE NAME: " + role.roleName);
+            System.out.println(requestBody);
+            System.out.println("=====================================================\n");
         }
 
-        for (int start = 0; start < total; start += batchSize) {
-            int end = Math.min(start + batchSize, total);
-            List<GroupMember> batch = members.subList(start, end);
-            int batchIndex = (start / batchSize) + 1;
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(SCIM_GROUPS_ENDPOINT))
+                .header("Content-Type", "application/scim+json")
+                .header("Accept", "application/scim+json")
+                .header("Authorization", basicAuth())
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
+                .build();
 
-            patchGroupAddMembersBatch(groupId, role, batch, batchIndex, batchCount);
-        }
-    }
+        RetryResult<HttpResponse<String>> rr = sendWithRetry(req, "GROUP", "CREATE_GROUP", null, role.roleName, null, requestBody);
 
-    /**
-     * Performs a single PATCH for a batch of members.
-     */
-    private static void patchGroupAddMembersBatch(String groupId,
-                                                  RoleRow role,
-                                                  List<GroupMember> batch,
-                                                  int batchIndex,
-                                                  int batchCount) {
-        String lastRequestBody = null;
-        String lastResponseBody = null;
-        int lastStatus = -1;
-
-        try {
-            ObjectNode root = MAPPER.createObjectNode();
-
-            ArrayNode schemas = MAPPER.createArrayNode();
-            schemas.add("urn:ietf:params:scim:api:messages:2.0:PatchOp");
-            root.set("schemas", schemas);
-
-            ArrayNode operations = MAPPER.createArrayNode();
-            ObjectNode op = MAPPER.createObjectNode();
-            op.put("op", "add");
-            op.put("path", "members");
-
-            ArrayNode valueArray = MAPPER.createArrayNode();
-            for (GroupMember m : batch) {
-                ObjectNode mem = MAPPER.createObjectNode();
-                mem.put("value", m.scimUserId);
-                mem.put("display", m.displayName);
-                valueArray.add(mem);
-            }
-            op.set("value", valueArray);
-            operations.add(op);
-            root.set("Operations", operations);
-
-            lastRequestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
-
-            String groupUrl = SCIM_GROUPS_ENDPOINT + "/" + groupId;
-
-            if (DEBUG) {
-                System.out.println("\n================ GROUP PATCH (ADD MEMBERS) BATCH ================");
-                System.out.println("Role UM_ID: " + role.umId + "  ROLE NAME: " + role.roleName);
-                System.out.println("Group SCIM ID: " + groupId);
-                System.out.println("Batch " + batchIndex + " of " + batchCount +
-                        "  Members in this batch: " + batch.size());
-                System.out.println(lastRequestBody);
-                System.out.println("================================================================\n");
-            }
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(groupUrl))
-                    .header("Content-Type", "application/scim+json")
-                    .header("Accept", "application/scim+json")
-                    .header("Authorization", basicAuth())
-                    .method("PATCH", HttpRequest.BodyPublishers.ofString(lastRequestBody, StandardCharsets.UTF_8))
-                    .build();
-
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-            lastStatus = response.statusCode();
-            lastResponseBody = response.body();
-
-            if (lastStatus >= 200 && lastStatus < 300) {
-                if (DEBUG) {
-                    System.out.println(" -> patched group " + groupId +
-                            " with " + batch.size() + " members (batch " +
-                            batchIndex + "/" + batchCount + ")");
-                }
-            } else {
-                System.err.println("Failed to PATCH members (batch " + batchIndex +
-                        "/" + batchCount + ") to group " + role.roleName +
-                        " HTTP " + lastStatus);
-                System.err.println(lastResponseBody);
-                errorRecords.add(new ErrorRecord(
+        if (rr.response != null && rr.response.statusCode() >= 200 && rr.response.statusCode() < 300) {
+            try {
+                ObjectNode respJson = (ObjectNode) MAPPER.readTree(rr.response.body());
+                return respJson.get("id").asText();
+            } catch (Exception e) {
+                logErrorImmediately(new ErrorRecord(
+                        nowIsoUtc(),
                         "GROUP",
-                        "PATCH_GROUP_ADD_MEMBERS_BATCH",
+                        "CREATE_GROUP_PARSE_RESPONSE",
+                        rr.attempt,
+                        rr.maxAttempts,
+                        rr.lastBackoffMs,
+                        rr.retryableReason,
                         null,
                         null,
                         role.umId,
                         role.roleName,
-                        groupUrl,
-                        lastStatus,
-                        lastRequestBody,
-                        lastResponseBody,
-                        "HTTP error in batch patch"
+                        SCIM_GROUPS_ENDPOINT,
+                        rr.response.statusCode(),
+                        requestBody,
+                        rr.response.body(),
+                        e.getMessage()
                 ));
             }
-        } catch (Exception e) {
-            String msg = "Exception in patchGroupAddMembersBatch (batch " +
-                    batchIndex + "/" + batchCount + "): " + e.getMessage();
-            System.err.println(msg);
-            errorRecords.add(new ErrorRecord(
-                    "GROUP",
-                    "PATCH_GROUP_ADD_MEMBERS_BATCH",
-                    null,
-                    null,
-                    role.umId,
-                    role.roleName,
-                    SCIM_GROUPS_ENDPOINT + "/" + groupId,
-                    lastStatus,
-                    lastRequestBody,
-                    lastResponseBody,
-                    msg
-            ));
+        }
+        return null;
+    }
+
+    private static void patchGroupAddMembers(String groupId, RoleRow role, List<GroupMember> members, UserRow userForContext) {
+        if (members == null || members.isEmpty()) return;
+
+        int total = members.size();
+        int batchSize = GROUP_PATCH_BATCH_SIZE;
+
+        for (int start = 0; start < total; start += batchSize) {
+            int end = Math.min(start + batchSize, total);
+            List<GroupMember> batch = members.subList(start, end);
+            patchGroupAddMembersBatch(groupId, role, batch, userForContext);
         }
     }
 
+    private static void patchGroupAddMembersBatch(String groupId, RoleRow role, List<GroupMember> batch, UserRow userForContext) {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode schemas = MAPPER.createArrayNode();
+        schemas.add("urn:ietf:params:scim:api:messages:2.0:PatchOp");
+        root.set("schemas", schemas);
+
+        ArrayNode operations = MAPPER.createArrayNode();
+        ObjectNode op = MAPPER.createObjectNode();
+        op.put("op", "add");
+        op.put("path", "members");
+
+        ArrayNode valueArray = MAPPER.createArrayNode();
+        for (GroupMember m : batch) {
+            ObjectNode mem = MAPPER.createObjectNode();
+            mem.put("value", m.scimUserId);
+            mem.put("display", m.displayName);
+            valueArray.add(mem);
+        }
+        op.set("value", valueArray);
+        operations.add(op);
+
+        root.set("Operations", operations);
+
+        String requestBody;
+        try {
+            requestBody = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root);
+        } catch (Exception e) {
+            logErrorImmediately(new ErrorRecord(
+                    nowIsoUtc(),
+                    "GROUP",
+                    "PATCH_GROUP_SERIALIZE",
+                    1,
+                    RETRY_MAX_ATTEMPTS,
+                    0,
+                    "serializationError",
+                    userForContext != null ? userForContext.umId : null,
+                    userForContext != null ? userForContext.userName : null,
+                    role.umId,
+                    role.roleName,
+                    SCIM_GROUPS_ENDPOINT + "/" + groupId,
+                    null,
+                    null,
+                    null,
+                    e.getMessage()
+            ));
+            return;
+        }
+
+        if (DEBUG) {
+            System.out.println("\n================ GROUP PATCH ADD MEMBER ================");
+            System.out.println("GroupId: " + groupId + " Role: " + role.roleName + " Members: " + batch.size());
+            System.out.println(requestBody);
+            System.out.println("========================================================\n");
+        }
+
+        String groupUrl = SCIM_GROUPS_ENDPOINT + "/" + groupId;
+
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(groupUrl))
+                .header("Content-Type", "application/scim+json")
+                .header("Accept", "application/scim+json")
+                .header("Authorization", basicAuth())
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
+                .build();
+
+        sendWithRetry(req, "GROUP", "PATCH_GROUP_ADD_MEMBER", userForContext, role.roleName, null, requestBody);
+        // Any final failure is logged inside sendWithRetry
+    }
+
     // ===================================================================================
-    // Write existing users and error log to files
+    // Retry wrapper + immediate error logging
+    // ===================================================================================
+
+    private static RetryResult<HttpResponse<String>> sendWithRetry(
+            HttpRequest req,
+            String type,
+            String operation,
+            UserRow user,
+            String roleName,
+            String userNameForSearch,
+            String requestBody
+    ) {
+        int attempt = 0;
+        long lastBackoff = 0;
+        String retryableReason = "";
+        HttpResponse<String> lastResponse = null;
+        Exception lastException = null;
+
+        while (attempt < RETRY_MAX_ATTEMPTS) {
+            attempt++;
+            try {
+                lastResponse = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+                int status = lastResponse.statusCode();
+
+                // success
+                if (status >= 200 && status < 300) {
+                    return new RetryResult<>(lastResponse, attempt, RETRY_MAX_ATTEMPTS, lastBackoff, retryableReason);
+                }
+
+                // retryable?
+                boolean retryable = (status == 429) || (status >= 500 && status <= 599);
+                retryableReason = "httpStatus=" + status;
+
+                if (!retryable || attempt >= RETRY_MAX_ATTEMPTS) {
+                    // final failure -> log now
+                    logErrorImmediately(new ErrorRecord(
+                            nowIsoUtc(),
+                            type,
+                            operation,
+                            attempt,
+                            RETRY_MAX_ATTEMPTS,
+                            lastBackoff,
+                            retryableReason,
+                            user != null ? user.umId : null,
+                            user != null ? user.userName : userNameForSearch,
+                            null,
+                            roleName,
+                            req.uri().toString(),
+                            status,
+                            requestBody,
+                            lastResponse.body(),
+                            "HTTP error"
+                    ));
+                    return new RetryResult<>(lastResponse, attempt, RETRY_MAX_ATTEMPTS, lastBackoff, retryableReason);
+                }
+
+            } catch (Exception e) {
+                lastException = e;
+                retryableReason = "exception=" + e.getClass().getSimpleName();
+
+                if (attempt >= RETRY_MAX_ATTEMPTS) {
+                    logErrorImmediately(new ErrorRecord(
+                            nowIsoUtc(),
+                            type,
+                            operation,
+                            attempt,
+                            RETRY_MAX_ATTEMPTS,
+                            lastBackoff,
+                            retryableReason,
+                            user != null ? user.umId : null,
+                            user != null ? user.userName : userNameForSearch,
+                            null,
+                            roleName,
+                            req.uri().toString(),
+                            null,
+                            requestBody,
+                            null,
+                            e.getMessage()
+                    ));
+                    return new RetryResult<>(null, attempt, RETRY_MAX_ATTEMPTS, lastBackoff, retryableReason);
+                }
+            }
+
+            // backoff before retry
+            lastBackoff = computeBackoffMs(attempt);
+            try {
+                Thread.sleep(lastBackoff);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                // log and stop
+                logErrorImmediately(new ErrorRecord(
+                        nowIsoUtc(),
+                        type,
+                        operation,
+                        attempt,
+                        RETRY_MAX_ATTEMPTS,
+                        lastBackoff,
+                        "interrupted",
+                        user != null ? user.umId : null,
+                        user != null ? user.userName : userNameForSearch,
+                        null,
+                        roleName,
+                        req.uri().toString(),
+                        lastResponse != null ? lastResponse.statusCode() : null,
+                        requestBody,
+                        lastResponse != null ? lastResponse.body() : null,
+                        "Interrupted during backoff"
+                ));
+                return new RetryResult<>(lastResponse, attempt, RETRY_MAX_ATTEMPTS, lastBackoff, "interrupted");
+            }
+        }
+
+        // Should not reach
+        if (lastException != null) {
+            logErrorImmediately(new ErrorRecord(
+                    nowIsoUtc(),
+                    type,
+                    operation,
+                    attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    lastBackoff,
+                    retryableReason,
+                    user != null ? user.umId : null,
+                    user != null ? user.userName : userNameForSearch,
+                    null,
+                    roleName,
+                    req.uri().toString(),
+                    null,
+                    requestBody,
+                    null,
+                    lastException.getMessage()
+            ));
+        }
+        return new RetryResult<>(lastResponse, attempt, RETRY_MAX_ATTEMPTS, lastBackoff, retryableReason);
+    }
+
+    private static long computeBackoffMs(int attempt) {
+        // exponential: base * 2^(attempt-1), capped + jitter
+        long exp = RETRY_BASE_DELAY_MS * (1L << Math.max(0, attempt - 1));
+        long capped = Math.min(exp, RETRY_MAX_DELAY_MS);
+        long jitter = (RETRY_JITTER_MS <= 0) ? 0 : new Random().nextLong(RETRY_JITTER_MS + 1);
+        return capped + jitter;
+    }
+
+    private static synchronized void logErrorImmediately(ErrorRecord r) {
+        boolean isUser = "USER".equalsIgnoreCase(r.type);
+        Path path = Path.of(isUser ? ERROR_LOG_USER_OUT : ERROR_LOG_GROUP_OUT);
+
+        try (BufferedWriter writer = Files.newBufferedWriter(
+                path,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND
+        )) {
+            if (isUser && !userErrorHeaderWritten) {
+                writer.write(ErrorRecord.header());
+                writer.newLine();
+                userErrorHeaderWritten = true;
+            }
+            if (!isUser && !groupErrorHeaderWritten) {
+                writer.write(ErrorRecord.header());
+                writer.newLine();
+                groupErrorHeaderWritten = true;
+            }
+
+            writer.write(r.toCsvLine());
+            writer.newLine();
+            writer.newLine(); // blank line between errors
+
+        } catch (IOException e) {
+            System.err.println("❌ Failed to write error immediately: " + e.getMessage());
+        }
+    }
+
+    private static String nowIsoUtc() {
+        return DateTimeFormatter.ISO_INSTANT.format(Instant.now());
+    }
+
+    // ===================================================================================
+    // Existing users file
     // ===================================================================================
 
     private static void writeExistingUsersToFile(String filePath) {
-        if (existingUsers.isEmpty()) {
-            if (DEBUG) {
-                System.out.println("No existing users to write.");
-            }
-            return;
-        }
+        if (existingUsers.isEmpty()) return;
 
         Path path = Path.of(filePath);
         try (BufferedWriter writer = Files.newBufferedWriter(
@@ -957,55 +962,7 @@ public class CSVSCIMImporterV1 {
             }
         } catch (IOException e) {
             System.err.println("Failed to write existing users file: " + e.getMessage());
-            e.printStackTrace();
         }
-    }
-
-    private static void writeErrorRecordsToFile(String filePath) {
-        if (errorRecords.isEmpty()) {
-            if (DEBUG) {
-                System.out.println("No errors to write.");
-            }
-            return;
-        }
-
-        Path path = Path.of(filePath);
-        try (BufferedWriter writer = Files.newBufferedWriter(
-                path,
-                StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING
-        )) {
-            writer.write("type,operation,um_id,userName,role_id,roleName,endpoint,httpStatus,requestBody,responseBody,errorMessage");
-            writer.newLine();
-
-            for (ErrorRecord r : errorRecords) {
-                writer.write(String.join(",",
-                        safeCsv(r.type),
-                        safeCsv(r.operation),
-                        safeCsv(r.umId),
-                        safeCsv(r.userName),
-                        safeCsv(r.roleId),
-                        safeCsv(r.roleName),
-                        safeCsv(r.endpoint),
-                        r.httpStatus == null ? "" : r.httpStatus.toString(),
-                        safeCsv(r.requestBody),
-                        safeCsv(r.responseBody),
-                        safeCsv(r.errorMessage)
-                ));
-                writer.newLine();   // end of record
-                writer.newLine();   // extra blank line between errors
-            }
-        } catch (IOException e) {
-            System.err.println("Failed to write error log file: " + e.getMessage());
-            e.printStackTrace();
-        }
-    }
-
-    private static String safeCsv(String v) {
-        if (v == null) return "";
-        v = v.replace("\n", " ").replace("\r", " ");
-        return v;
     }
 
     // ===================================================================================
@@ -1014,59 +971,60 @@ public class CSVSCIMImporterV1 {
 
     private static String basicAuth() {
         String creds = SCIM_USERNAME + ":" + SCIM_PASSWORD;
-        String base64 = Base64.getEncoder()
-                .encodeToString(creds.getBytes(StandardCharsets.UTF_8));
+        String base64 = Base64.getEncoder().encodeToString(creds.getBytes(StandardCharsets.UTF_8));
         return "Basic " + base64;
     }
 
     private static String firstNonNull(String... values) {
         if (values == null) return null;
         for (String v : values) {
-            if (v != null && !v.isBlank()) {
-                return v;
-            }
+            if (v != null && !v.isBlank()) return v;
         }
         return null;
     }
 
     private static String withUserStoreDomain(String userName) {
         if (userName == null) return null;
-        if (userName.contains("/")) {
-            return userName;
-        }
+        if (userName.contains("/")) return userName;
         return USER_STORE_DOMAIN + "/" + userName;
     }
 
     private static String withGroupStoreDomain(String roleName) {
         if (roleName == null) return null;
-        if (roleName.contains("/")) {
-            // Already has a domain prefix
-            return roleName;
-        }
+        if (roleName.contains("/")) return roleName;
         return GROUP_STORE_DOMAIN + "/" + roleName;
     }
+
+    private static String safeCsv(String v) {
+        if (v == null) return "";
+        v = v.replace("\n", " ").replace("\r", " ");
+        // keep it simple: wrap if it contains comma or quote
+        if (v.contains(",") || v.contains("\"")) {
+            v = v.replace("\"", "\"\"");
+            return "\"" + v + "\"";
+        }
+        return v;
+    }
+
+    // ===================================================================================
+    // Data classes
+    // ===================================================================================
 
     private static class UserRow {
         String umId;
         String userName;
         String password;
-        String salt;
-        String requireChange;
-        String changedTime;
         String tenantId;
     }
 
     private static class RoleRow {
         String umId;
         String roleName;
-        String tenantId;
-        String sharedRole;
     }
 
     private static class UserRoleMapping {
         String umUserId;
         String umRoleId;
-        String tenantId;
     }
 
     private static class GroupMember {
@@ -1091,29 +1049,66 @@ public class CSVSCIMImporterV1 {
         }
     }
 
+    private static class RetryResult<T> {
+        final T response;
+        final int attempt;
+        final int maxAttempts;
+        final long lastBackoffMs;
+        final String retryableReason;
+
+        RetryResult(T response, int attempt, int maxAttempts, long lastBackoffMs, String retryableReason) {
+            this.response = response;
+            this.attempt = attempt;
+            this.maxAttempts = maxAttempts;
+            this.lastBackoffMs = lastBackoffMs;
+            this.retryableReason = retryableReason;
+        }
+    }
+
     private static class ErrorRecord {
-        final String type;
-        final String operation;
+        final String timestampIsoUtc;
+        final String type;             // USER or GROUP
+        final String operation;        // e.g. CREATE_USER
+        final int attempt;
+        final int maxAttempts;
+        final long lastBackoffMs;
+        final String retryableReason;
+
         final String umId;
         final String userName;
+
         final String roleId;
         final String roleName;
+
         final String endpoint;
         final Integer httpStatus;
         final String requestBody;
         final String responseBody;
         final String errorMessage;
 
-        ErrorRecord(String type, String operation,
-                    String umId, String userName,
-                    String roleId, String roleName,
+        ErrorRecord(String timestampIsoUtc,
+                    String type,
+                    String operation,
+                    int attempt,
+                    int maxAttempts,
+                    long lastBackoffMs,
+                    String retryableReason,
+                    String umId,
+                    String userName,
+                    String roleId,
+                    String roleName,
                     String endpoint,
                     Integer httpStatus,
                     String requestBody,
                     String responseBody,
                     String errorMessage) {
+            this.timestampIsoUtc = timestampIsoUtc;
             this.type = type;
             this.operation = operation;
+            this.attempt = attempt;
+            this.maxAttempts = maxAttempts;
+            this.lastBackoffMs = lastBackoffMs;
+            this.retryableReason = retryableReason;
             this.umId = umId;
             this.userName = userName;
             this.roleId = roleId;
@@ -1125,16 +1120,46 @@ public class CSVSCIMImporterV1 {
             this.errorMessage = errorMessage;
         }
 
-        static ErrorRecord forException(String type, String operation,
-                                        String umId, String userName,
-                                        String roleId, String roleName,
-                                        String endpoint,
-                                        String requestBody,
-                                        String responseBody,
-                                        String errorMessage) {
-            return new ErrorRecord(type, operation, umId, userName,
-                    roleId, roleName, endpoint, null,
-                    requestBody, responseBody, errorMessage);
+        static String header() {
+            return String.join(",",
+                    "timestampIsoUtc",
+                    "type",
+                    "operation",
+                    "attempt",
+                    "maxAttempts",
+                    "lastBackoffMs",
+                    "retryableReason",
+                    "um_id",
+                    "userName",
+                    "role_id",
+                    "roleName",
+                    "endpoint",
+                    "httpStatus",
+                    "requestBody",
+                    "responseBody",
+                    "errorMessage"
+            );
+        }
+
+        String toCsvLine() {
+            return String.join(",",
+                    safeCsv(timestampIsoUtc),
+                    safeCsv(type),
+                    safeCsv(operation),
+                    String.valueOf(attempt),
+                    String.valueOf(maxAttempts),
+                    String.valueOf(lastBackoffMs),
+                    safeCsv(retryableReason),
+                    safeCsv(umId),
+                    safeCsv(userName),
+                    safeCsv(roleId),
+                    safeCsv(roleName),
+                    safeCsv(endpoint),
+                    httpStatus == null ? "" : String.valueOf(httpStatus),
+                    safeCsv(requestBody),
+                    safeCsv(responseBody),
+                    safeCsv(errorMessage)
+            );
         }
     }
 }
