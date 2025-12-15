@@ -19,14 +19,14 @@ Following configurations has to be there in config.properties file
     # ==== WSO2 IS connection ====
     baseUrl=https://localhost:9443
     
-    # Tenant domain (what you asked for)
+    # Tenant domain 
     tenantDomain=test.com
     
-    # SCIM credentials (tenant admin if needed)
+    # SCIM credentials 
     scim.username=admin@test.com
     scim.password=123456
     
-    # Target user store (you asked: EUM)
+    # Target user store 
     userStore.domain=EUM2
     
     # Debug logging (true/false)
